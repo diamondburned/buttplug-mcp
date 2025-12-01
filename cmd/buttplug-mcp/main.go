@@ -3,9 +3,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
+	"os/signal"
+	"sync"
 
 	"github.com/ConAcademy/buttplug-mcp/internal/bp"
 	"github.com/ConAcademy/buttplug-mcp/internal/mcp"
@@ -18,7 +22,7 @@ const (
 	mcpServerVersion = "0.0.1"
 
 	defaultSSEHostPort = ":8889"
-	defaultLogDest     = "buttplug-mcp.log"
+	defaultLogDest     = "butplug-mcp.log"
 )
 
 type Config struct {
@@ -33,24 +37,23 @@ type Config struct {
 
 func main() {
 	var config Config
-	var showHelp bool
 	var logFilename string
 
 	pflag.StringVarP(&logFilename, "log-file", "l", "", "Log file destination (or MCP_LOG_FILE envvar). Default is stderr")
 	pflag.BoolVarP(&config.LogJSON, "log-json", "j", false, "Log in JSON (default is plaintext)")
 	pflag.StringVarP(&config.MCPConfig.SSEHostPort, "sse-host", "", "", "host:port to listen to SSE connections")
-	pflag.BoolVarP(&config.MCPConfig.UseSSE, "sse", "", false, "Use SSE Transport (default is STDIO transport)")
-	pflag.IntVarP(&config.BPConfig.WsPort, "ws-port", "", 0, "port to connect to the Buttplug Websocket server")
-	pflag.DurationVarP(&config.BPConfig.DebounceDuration, "debounce", "d", bp.DefaultDebounceDuration, "duration for debounce (default is 20Hz = '50ms')")
+	pflag.BoolVarP(&config.MCPConfig.UseSSE, "sse", "", false, "Use SSE Transport (default is stdio transport)")
+	pflag.StringVarP(&config.MCPConfig.ToolDescriptionsFile, "tool-descriptions", "", "", "Path to YAML file with tool descriptions to override defaults (run `tool-descriptions' to see current descriptions in YAML)")
+	pflag.StringVarP(&config.BPConfig.WebsocketHost, "ws-host", "", "localhost", "host to connect to the Buttplug Websocket server")
+	pflag.IntVarP(&config.BPConfig.WebsocketPort, "ws-port", "", 12345, "port to connect to the Buttplug Websocket server")
 	pflag.BoolVarP(&config.Verbose, "verbose", "v", false, "Verbose logging")
-	pflag.BoolVarP(&showHelp, "help", "h", false, "Show help")
-	pflag.Parse()
-
-	if showHelp {
-		fmt.Fprintf(os.Stdout, "usage: %s [opts]\n\n", os.Args[0])
+	pflag.Usage = func() {
+		o := pflag.CommandLine.Output()
+		fmt.Fprintf(o, "usage: %s [|start|tool-descriptions] [flags]\n", os.Args[0])
+		fmt.Fprintf(o, "flags:\n")
 		pflag.PrintDefaults()
-		os.Exit(0)
 	}
+	pflag.Parse()
 
 	if config.MCPConfig.SSEHostPort == "" {
 		config.MCPConfig.SSEHostPort = defaultSSEHostPort
@@ -67,8 +70,7 @@ func main() {
 	if logFilename != "" {
 		logFile, err := os.OpenFile(logFilename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to open log file: %s\n", err.Error())
-			os.Exit(1)
+			log.Fatal("failed to open log file:", err)
 		}
 		logWriter = logFile
 		defer logFile.Close()
@@ -86,26 +88,49 @@ func main() {
 		logger = slog.New(slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: logLevel}))
 	}
 
-	// Run our Buttplug manager
-	var err error
-	bpManager, err := bp.NewManager(config.BPConfig, logger)
+	bpm, err := bp.NewManager(config.BPConfig, logger)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to start Buttplug manager: %s\n", err.Error())
-		os.Exit(1)
+		log.Fatal("failed to create Buttplug manager:", err)
 	}
-	go func() {
-		err := bpManager.Run()
+
+	mcps, err := mcp.New(config.MCPConfig, bpm, logger)
+	if err != nil {
+		log.Fatal("failed to create MCP server:", err)
+	}
+
+	switch pflag.Arg(0) {
+	case "tool-descriptions":
+		yaml, err := mcp.FormatToolDescriptionsAsYAML(mcps.ToolDescriptions())
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "bpm failed: %s\n", err.Error())
-			os.Exit(1)
+			log.Fatal("failed to format tool descriptions as YAML:", err)
 		}
-	}()
+		fmt.Println(string(yaml))
+		return
 
-	// Run our MCP server
-	if err := mcp.RunRouter(config.MCPConfig, bpManager, logger); err != nil {
-		logger.Error("mcp router error", "error", err.Error())
-		os.Exit(1)
+	case "start", "":
+		// continue to starting the server
+
+	default:
+		log.Fatalf("unknown command: %s", pflag.Arg(0))
 	}
 
-	// TODO: I guess we should clean up the buttplug?
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	wg.Go(func() {
+		if err := bpm.Run(ctx); err != nil {
+			logger.Error(
+				"buttplug manager error, program is useless now",
+				"error", err.Error())
+		}
+	})
+
+	if err := mcps.Start(); err != nil {
+		logger.Error(
+			"failed to start MCP server:",
+			"error", err.Error())
+	}
 }

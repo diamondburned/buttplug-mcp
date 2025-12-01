@@ -1,0 +1,48 @@
+_:
+  instructions: >-
+    Control the user's sex toys (vibrators, buttplugs, etc.) via Buttplug.io
+    over the model context protocol (MCP) server.
+
+get_device_ids:
+  description: >-
+    Lists all connected devices available for use on the subject. This is the
+    first step. Run this to take inventory of your tools before beginning a
+    session. The output provides the `id` numbers needed for all other device
+    commands.
+
+get_device_by_id:
+  description: >-
+    Retrieves the specifications for a specific device `id`. Use this to
+    understand the tool you are using to control it. Knowing its name and
+    capabilities (e.g., number of motors, vibration/rotation functions) allows
+    for more precise and effective manipulation.
+  parameters:
+    id:
+      description: "Device index to query, sourced from `get_device_ids`."
+
+device_vibrate:
+  description: >-
+    The primary command for direct stimulation. Controls device `id` at a
+    precise `strength` (0.0-1.0) for `duration_sec`.
+
+  parameters:
+    id:
+      description: "Device index to control, sourced from `get_device_ids`."
+    strength:
+      description: "Vibration intensity from 0.0 (off) to 1.0 (maximum)."
+    duration_sec:
+      description: >-
+        Duration of vibration in seconds. If zero, vibrate indefinitely until
+        another command is sent. Avoid setting this to zero unless you
+        definitely plan to stop the device later.
+    stop_after_duration:
+      description: >-
+        If true, stops vibrating after `duration_sec`. Set to false if you
+        plan to layer commands or manually control the stop time.
+
+device_stop:
+  description: >-
+    Instantly ceases all activity on device `id`.
+  parameters:
+    id:
+      description: "Device index to stop, sourced from `get_device_ids`."

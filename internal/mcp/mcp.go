@@ -1,5 +1,7 @@
 // Copyright (c) 2025 Neomantra BV
 
+// Package mcp implements the model context protocol server for Buttplug.io
+// device control.
 package mcp
 
 import (
@@ -7,150 +9,161 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/url"
+	"os"
 	"regexp"
 	"strconv"
+	"time"
 
 	"github.com/ConAcademy/buttplug-mcp/internal/bp"
-	"github.com/diamondburned/go-buttplug"
-	"github.com/diamondburned/go-buttplug/device"
+	"github.com/goccy/go-yaml"
 	"github.com/mark3labs/mcp-go/mcp"
-	mcp_server "github.com/mark3labs/mcp-go/server"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 
-const (
-	regex10  = `^(0(\.\d+)?|1(\.0+)?)$`
-	regexInt = `^[0-9]*$`
-)
+const regexInt = `^[0-9]*$`
 
-// Config is configuration for our MCP server
+// Config is configuration for our MCP server.
 type Config struct {
-	Name    string // Service Name
-	Version string // Service Version
-
+	Name        string // Service Name
+	Version     string // Service Version
 	UseSSE      bool   // Use SSE Transport instead of STDIO
 	SSEHostPort string // HostPort to use for SSE
+
+	// ToolDescriptionsFile is the path to a YAML file containing tool
+	// descriptions to override defaults.
+	ToolDescriptionsFile string
+
+	// ButtplugWebsocketAddress is the address of the Buttplug Websocket server
+	// to connect to.
+	ButtplugWebsocketAddress string
 }
 
-// we resort to module-global variable rather than setting up closures
-var bpManager *bp.Manager
+// Server is our MCP server.
+type Server struct {
+	mcp    *mcpserver.MCPServer
+	bpm    *bp.Manager
+	logger *slog.Logger
+	config Config
+	td     ToolDescriptions
+}
 
-//////////////////////////////////////////////////////////////////////////////
-
-func RunRouter(config Config, bpm *bp.Manager, logger *slog.Logger) error {
-	// Set module global for handlers
-	bpManager = bpm
-
-	// Create the MCP Server
-	mcpServer := mcp_server.NewMCPServer(config.Name, config.Version)
-	registerTools(mcpServer)
-
-	if config.UseSSE {
-		sseServer := mcp_server.NewSSEServer(mcpServer)
-		logger.Info("MCP SSE server started", "hostPort", config.SSEHostPort)
-		if err := sseServer.Start(config.SSEHostPort); err != nil {
-			return fmt.Errorf("MCP SSE server error: %w", err)
+// New creates a new MCP server with the given configuration.
+func New(config Config, bpm *bp.Manager, logger *slog.Logger) (*Server, error) {
+	td := defaultToolDescriptions()
+	if config.ToolDescriptionsFile != "" {
+		b, err := os.ReadFile(config.ToolDescriptionsFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read tool descriptions file: %w", err)
 		}
-	} else {
-		logger.Info("MCP STDIO server started")
-		if err := mcp_server.ServeStdio(mcpServer); err != nil {
-			return fmt.Errorf("MCP STDIO server error: %w", err)
+		if err := yaml.Unmarshal(b, &td); err != nil {
+			return nil, fmt.Errorf("failed to parse tool descriptions file: %w", err)
 		}
 	}
 
-	return nil
+	// Create the MCP Server
+	mcp := mcpserver.NewMCPServer(
+		config.Name, config.Version,
+		mcpserver.WithToolCapabilities(true), // Enable tools
+		mcpserver.WithInstructions(td.ForTool("_")),
+	)
+
+	s := &Server{
+		mcp:    mcp,
+		bpm:    bpm,
+		logger: logger,
+		config: config,
+		td:     td,
+	}
+	s.registerTools()
+
+	return s, nil
 }
 
-///////////////////////////////////////////////////////////////////////////////
+// ToolDescriptions returns the tool descriptions used by the server, which may
+// be merged with user-provided descriptions.
+func (s *Server) ToolDescriptions() ToolDescriptions {
+	return s.td
+}
+
+// Start starts the MCP server.
+func (s *Server) Start() error {
+	if s.config.UseSSE {
+		s.logger.Info("MCP SSE server starting", "hostPort", s.config.SSEHostPort)
+		return mcpserver.NewSSEServer(s.mcp).Start(s.config.SSEHostPort)
+	} else {
+		s.logger.Info("MCP stdio server starting")
+		return mcpserver.ServeStdio(s.mcp)
+	}
+}
 
 // registerTools registers tools+metadata with the passed MCPServer
-func registerTools(mcpServer *mcp_server.MCPServer) error {
-	// /devices
-	mcpServer.AddResource(mcp.NewResource("/devices", "Device List",
-		mcp.WithResourceDescription("List of connected Buttplug devices in JSON"),
-		mcp.WithMIMEType("application/json"),
-	), getDeviceListHandler)
-	// /device/{id}
-	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate("/device/{id}", "Device Info by ID",
-		mcp.WithTemplateDescription("Device information by device ID where `id` is a number from `/devices`"),
-		mcp.WithTemplateMIMEType("application/json"),
-	), getDeviceInfoHandler)
-	// /device/{id}/rssi
-	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate("/device/{id}/rssi", "Signal Level for Device by ID",
-		mcp.WithTemplateDescription("RSSI signal level by device ID where `id` is a number from `/devices`"),
-		mcp.WithTemplateMIMEType("application/json"),
-	), getDeviceRssiHandler)
-	// /device/{id}/battery
-	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate("/device/{id}/battery", "Battery Level for Device by ID",
-		mcp.WithTemplateDescription("Battery level by device ID where `id` is a number from `/devices`"),
-		mcp.WithTemplateMIMEType("application/json"),
-	), getDeviceBatteryHandler)
-	// /device/vibrate
-	mcpServer.AddTool(mcp.NewTool("device_vibrate",
-		mcp.WithDescription("Vibrates device by `id`, selecting `strength` and optional `motor`"),
+func (s *Server) registerTools() {
+	// get_device_ids
+	s.mcp.AddTool(mcp.NewTool("get_device_ids",
+		mcp.WithTitleAnnotation("Get Device IDs"),
+		mcp.WithDescription(s.td.ForTool("get_device_ids")),
+	), s.handleDeviceListTool)
+
+	// get_device_by_id
+	s.mcp.AddTool(mcp.NewTool("get_device_by_id",
+		mcp.WithTitleAnnotation("Get Device By ID"),
+		mcp.WithDescription(s.td.ForTool("get_device_by_id")),
 		mcp.WithNumber("id",
 			mcp.Required(),
-			mcp.Description("Device ID to query, sourced from `/devices`"),
+			mcp.Description(s.td.ForToolParameter("get_device_by_id", "id")),
+			mcp.Pattern(regexInt),
+		),
+	), s.handleDeviceOneTool)
+
+	// device_vibrate
+	s.mcp.AddTool(mcp.NewTool("device_vibrate",
+		mcp.WithTitleAnnotation("Device Vibrate"),
+		mcp.WithDescription(s.td.ForTool("device_vibrate")),
+		mcp.WithNumber("id",
+			mcp.Required(),
+			mcp.Description(s.td.ForToolParameter("device_vibrate", "id")),
 			mcp.Pattern(regexInt),
 		),
 		mcp.WithNumber("strength",
 			mcp.Required(),
-			mcp.Description("Strength from 0.0 to 1.0, with 0.0 being off and 1.0 being full"),
-			mcp.Pattern(regex10),
+			mcp.Description(s.td.ForToolParameter("device_vibrate", "strength")),
+			mcp.DefaultNumber(1.0),
+			mcp.Min(0.0),
+			mcp.Max(1.0),
 		),
-		mcp.WithNumber("motor",
-			mcp.Description("Motor number to vibrate, defaults to 0"),
+		mcp.WithNumber("duration_sec",
+			mcp.Required(),
+			mcp.Description(s.td.ForToolParameter("device_vibrate", "duration_sec")),
+			mcp.DefaultNumber(0.0),
+			mcp.Min(0.0),
+			mcp.Max(3600.0),
+		),
+		mcp.WithBoolean("stop_after_duration",
+			mcp.Description(s.td.ForToolParameter("device_vibrate", "stop_after_duration")),
+			mcp.DefaultBool(true),
+		),
+	), s.handleDeviceVibrate)
+
+	// device_stop
+	s.mcp.AddTool(mcp.NewTool("device_stop",
+		mcp.WithTitleAnnotation("Device Stop"),
+		mcp.WithDescription(s.td.ForTool("device_stop")),
+		mcp.WithNumber("id",
+			mcp.Required(),
+			mcp.Description(s.td.ForToolParameter("device_stop", "id")),
 			mcp.Pattern(regexInt),
 		),
-	), vibrateDeviceHandler)
-
-	return nil
+	), s.handleDeviceStop)
 }
 
-type RssiResponse struct {
-	RssiLevel float64 `json:"rssi_level"`
-}
-
-type BatteryResponse struct {
-	BatteryLevel float64 `json:"battery_level"`
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
-func getDeviceListHandler(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	if bpManager == nil {
-		return nil, fmt.Errorf("Buttplug manager not initialized")
-	}
-
-	devices := bpManager.GetDeviceManager().Devices()
-
-	jbytes, err := json.Marshal(devices)
+func (s *Server) handleDeviceList(_ context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	jbytes, err := s.handleDeviceListRaw()
 	if err != nil {
-		return nil, fmt.Errorf("failed to json.Marshal devices: %w", err)
+		return nil, err
 	}
 
 	return []mcp.ResourceContents{
-		mcp.TextResourceContents{
-			URI:      "/devices",
-			MIMEType: "application/json",
-			Text:     string(jbytes),
-		},
-	}, nil
-}
-
-func getDeviceInfoHandler(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	ctrl, err := controllerFromPattern(request, "/device/:id")
-	if err != nil {
-		return nil, fmt.Errorf("failed to extract controller: %w", err)
-	}
-
-	jbytes, err := json.Marshal(ctrl.Device)
-	if err != nil {
-		return nil, fmt.Errorf("failed to json.Marshal devices: %w", err)
-	}
-
-	return []mcp.ResourceContents{
-		mcp.TextResourceContents{
+		&mcp.TextResourceContents{
 			URI:      request.Params.URI,
 			MIMEType: "application/json",
 			Text:     string(jbytes),
@@ -158,26 +171,41 @@ func getDeviceInfoHandler(ctx context.Context, request mcp.ReadResourceRequest) 
 	}, nil
 }
 
-func getDeviceRssiHandler(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	ctrl, err := controllerFromPattern(request, "/device/:id/rssi")
+func (s *Server) handleDeviceListTool(_ context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	jbytes, err := s.handleDeviceListRaw()
 	if err != nil {
-		return nil, fmt.Errorf("failed to extract controller: %w", err)
+		return nil, err
 	}
 
-	rssiLevel, err := ctrl.RSSILevel()
-	if err != nil {
-		return nil, fmt.Errorf("failed to query rssi: %w", err)
-	}
+	return mcp.NewToolResultText(string(jbytes)), nil
+}
 
-	jbytes, err := json.Marshal(RssiResponse{
-		RssiLevel: rssiLevel,
+func (s *Server) handleDeviceListRaw() (json.RawMessage, error) {
+	return json.Marshal(map[string]any{
+		"device_ids": s.bpm.DeviceIndexes(),
 	})
+}
+
+var reDeviceID = regexp.MustCompile(`/device/(\d+)`)
+
+func (s *Server) handleDeviceOne(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	deviceIDMatch := reDeviceID.FindStringSubmatch(request.Params.URI)
+	if deviceIDMatch == nil {
+		return nil, fmt.Errorf("invalid device ID in URI")
+	}
+
+	deviceID, err := strconv.Atoi(deviceIDMatch[1])
 	if err != nil {
-		return nil, fmt.Errorf("failed to json.Marshal rssi: %w", err)
+		return nil, fmt.Errorf("invalid device ID: %w", err)
+	}
+
+	jbytes, err := s.handleDeviceOneRaw(ctx, deviceID)
+	if err != nil {
+		return nil, err
 	}
 
 	return []mcp.ResourceContents{
-		mcp.TextResourceContents{
+		&mcp.TextResourceContents{
 			URI:      request.Params.URI,
 			MIMEType: "application/json",
 			Text:     string(jbytes),
@@ -185,120 +213,87 @@ func getDeviceRssiHandler(ctx context.Context, request mcp.ReadResourceRequest) 
 	}, nil
 }
 
-func getDeviceBatteryHandler(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	ctrl, err := controllerFromPattern(request, "/device/:id/battery")
+func (s *Server) handleDeviceOneTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	deviceID, err := request.RequireInt("id")
 	if err != nil {
-		return nil, fmt.Errorf("failed to extract controller: %w", err)
-	}
-
-	batteryLevel, err := ctrl.Battery()
-	if err != nil {
-		return nil, fmt.Errorf("failed to query battery: %w", err)
-	}
-
-	jbytes, err := json.Marshal(BatteryResponse{
-		BatteryLevel: batteryLevel,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to json.Marshal battery: %w", err)
-	}
-
-	return []mcp.ResourceContents{
-		mcp.TextResourceContents{
-			URI:      request.Params.URI,
-			MIMEType: "application/json",
-			Text:     string(jbytes),
-		},
-	}, nil
-}
-
-func vibrateDeviceHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	var deviceID, motorID int
-	var strength float64
-	var err error
-
-	if deviceID, err = request.RequireInt("id"); err != nil {
 		return nil, fmt.Errorf("id must be set %w", err)
 	}
-	if strength, err = request.RequireFloat("strength"); err != nil {
+
+	jbytes, err := s.handleDeviceOneRaw(ctx, deviceID)
+	if err != nil {
+		return nil, err
+	}
+
+	return mcp.NewToolResultText(string(jbytes)), nil
+}
+
+func (s *Server) handleDeviceOneRaw(ctx context.Context, deviceID int) (json.RawMessage, error) {
+	device, err := s.bpm.Device(ctx, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query device %d: %w", deviceID, err)
+	}
+
+	return json.Marshal(map[string]any{
+		"device_id": deviceID,
+		"device":    device,
+	})
+}
+
+func (s *Server) handleDeviceVibrate(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	deviceID, err := request.RequireInt("id")
+	if err != nil {
+		return nil, fmt.Errorf("id must be set %w", err)
+	}
+
+	strength, err := request.RequireFloat("strength")
+	if err != nil {
 		return nil, fmt.Errorf("strength must be set %w", err)
 	}
-	if motorID, err = request.RequireInt("motor"); err != nil {
-		motorID = 0 // it's OK, it's optional and we default to 0
-	}
 
-	ctrl := bpManager.GetDeviceManager().Controller(
-		bpManager.GetConnection(),
-		buttplug.DeviceIndex(deviceID))
-	if ctrl == nil {
-		return nil, fmt.Errorf("Device %d not found", deviceID)
-	}
-
-	// var form struct {
-	// 	Motor    int     `json:"motor"` // default 0
-	// 	Strength float64 `json:"strength,required"`
-	// }
-
-	err = ctrl.Vibrate(map[int]float64{
-		motorID: strength,
-	})
+	durationSec, err := request.RequireFloat("duration_sec")
 	if err != nil {
-		return nil, fmt.Errorf("Vibrate on device %d failed: %w", deviceID, err)
+		return nil, fmt.Errorf("duration_sec must be set %w", err)
+	}
+
+	stopAfterDuration, err := request.RequireBool("stop_after_duration")
+	if err != nil {
+		return nil, fmt.Errorf("stop_after_duration must be set %w", err)
+	}
+
+	if err := s.bpm.DeviceVibrate(ctx, deviceID, strength); err != nil {
+		return nil, fmt.Errorf("failed to vibrate device %d: %w", deviceID, err)
+	}
+
+	if durationSec == 0 {
+		return mcp.NewToolResultText(`{ "success": true, "stopped": false }`), nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(time.Duration(durationSec * float64(time.Second))):
+	}
+
+	if stopAfterDuration {
+		if err := s.bpm.DeviceStop(ctx, deviceID); err != nil {
+			return nil, fmt.Errorf("failed to stop device %d after duration: %w", deviceID, err)
+		}
+
+		return mcp.NewToolResultText(`{ "success": true, "stopped": true }`), nil
+	} else {
+		return mcp.NewToolResultText(`{ "success": true, "stopped": false }`), nil
+	}
+}
+
+func (s *Server) handleDeviceStop(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	deviceID, err := request.RequireInt("id")
+	if err != nil {
+		return nil, fmt.Errorf("id must be set %w", err)
+	}
+
+	if err := s.bpm.DeviceStop(ctx, deviceID); err != nil {
+		return nil, fmt.Errorf("failed to stop device %d: %w", deviceID, err)
 	}
 
 	return mcp.NewToolResultText(`{ "success": true }`), nil
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
-// controllerFromPattern gets the device's controller from the request. It
-// writes the error directly into the given response writer and returns nil if
-// the device cannot be found.
-func controllerFromPattern(request mcp.ReadResourceRequest, pattern string) (*device.Controller, error) {
-	// Parse URL for analysis
-	parsedURL, err := url.Parse(request.Params.URI)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing uri: %w", err)
-	}
-
-	// Extract the ID from the path
-	params := extractPattern(pattern, parsedURL.Path)
-	deviceIDStr, found := params["id"]
-	if !found {
-		return nil, fmt.Errorf("Device ID not found in path")
-	}
-
-	deviceID, err := strconv.Atoi(deviceIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("Device ID could not be converted to integer")
-	}
-
-	ctrl := bpManager.GetDeviceManager().Controller(bpManager.GetConnection(), buttplug.DeviceIndex(deviceID))
-	if ctrl == nil {
-		return nil, fmt.Errorf("Device %d not found", deviceID)
-	}
-
-	return ctrl, nil
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
-// extractPattern scans a path for pattern, putting `:var` into a returned map by name
-func extractPattern(pattern string, path string) map[string]string {
-	regex := regexp.MustCompile(`:([a-zA-Z0-9]+)`)
-	matches := regex.FindAllStringSubmatch(pattern, -1)
-
-	patternRegex := regexp.MustCompile("^" + regex.ReplaceAllString(pattern, "([^/]+)") + "$")
-	pathMatches := patternRegex.FindStringSubmatch(path)
-
-	if len(pathMatches) == 0 {
-		return nil
-	}
-
-	params := make(map[string]string)
-	for i, match := range matches {
-		params[match[1]] = pathMatches[i+1]
-	}
-
-	return params
 }
