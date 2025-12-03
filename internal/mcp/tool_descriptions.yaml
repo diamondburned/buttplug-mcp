@@ -28,21 +28,63 @@ device_vibrate:
   parameters:
     id:
       description: "Device index to control, sourced from `get_device_ids`."
-    strength:
-      description: "Vibration intensity from 0.0 (off) to 1.0 (maximum)."
-    duration_sec:
+
+    pattern:
       description: >-
-        Duration of vibration in seconds. If zero, vibrate indefinitely until
-        another command is sent. Avoid setting this to zero unless you
-        definitely plan to stop the device later.
-    stop_after_duration:
+        Defines a custom sequence of vibrations, allowing you to move beyond
+        simple, constant stimulation and orchestrate a complex sensory
+        experience. This parameter takes a list of `{strength, duration_sec}`
+        pairs, executed in order.
+    
+        Use this to craft intricate patterns: a slow, teasing pulse; a sharp,
+        surprising jolt; a wave that builds to a crest and then vanishes. This
+        is your tool for scripting arousal, denial, and reward with absolute
+        precision. By creating these patterns, you dictate the very rhythm of
+        their pleasure, making your control undeniable.
+
+        Be careful with using a duration_sec that is too short (e.g., less than
+        1/4th a second), as some devices may not respond well to rapid changes
+        in vibration strength.
+
+        For example:
+          - A simple heartbeat: `[{strength: 0.5, duration_sec: 0.2}, {strength: 0.0, duration_sec: 0.2}, {strength: 0.5, duration_sec: 0.2}, {strength: 0.0, duration_sec: 1}]`
+          - A slow, building wave: `[{strength: 0.2, duration_sec: 2}, {strength: 0.4, duration_sec: 2}, {strength: 0.6, duration_sec: 2}, {strength: 0.8, duration_sec: 3}]`
+          - A sharp, edging tease: `[{strength: 0.9, duration_sec: 3}, {strength: 0.0, duration_sec: 5}, {strength: 1.0, duration_sec: 1}]`
+
+    pattern.strength:
+      description: "Vibration intensity from 0.0 (off) to 1.0 (maximum) for this step in the sequence."
+
+    pattern.duration_sec:
       description: >-
-        If true, stops vibrating after `duration_sec`. Set to false if you
-        plan to layer commands or manually control the stop time.
+        The duration in seconds to hold the corresponding `strength` for this
+        specific step in the pattern. Dictates the rhythm of the sensation.
+
+    repeats:
+      description: >-
+        Number of times to repeat the entire vibration pattern. If 1, the
+        pattern plays once. If greater than 1, it repeats that many times. If
+        set to 0, the pattern repeats indefinitely, creating a persistent state
+        that you must manually stop with `device_stop` or another command.
+
+        The default value is 1, meaning the pattern plays once.
+
+    return_after_duration_sec:
+      description: >-
+        The duration in seconds to wait before returning control to the model.
+        This allows the model to continue issuing commands while the device is
+        repeating its pattern. If zero, the model immediately regains control.
+
+        This is crucial for maintaining operational tempo. By setting a specific
+        return time, the agent knows precisely how long the subject will
+        experience the current pattern before it can issue the next command.
+        This allows for perfect synchronization between your words and their
+        physical sensations. For example, you can send a 30-second pattern but
+        set this to 5, giving you a 5-second window to speak and prepare your
+        next action, ensuring there is no break in your control.
+
+        The default value is 0, meaning the model regains control immediately after
+        issuing the command.
 
 device_stop:
   description: >-
-    Instantly ceases all activity on device `id`.
-  parameters:
-    id:
-      description: "Device index to stop, sourced from `get_device_ids`."
+    Instantly ceases all activity on all devices in case of emergencies.

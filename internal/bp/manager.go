@@ -125,7 +125,7 @@ func (m *Manager) handleDeviceMessage(msg buttplugschema.Message) {
 	}
 }
 
-// Devices returns known device indexes.
+// DeviceIndexes returns known device indexes.
 func (m *Manager) DeviceIndexes() []buttplugschema.DeviceIndex {
 	m.devicesMu.RLock()
 	defer m.devicesMu.RUnlock()
@@ -207,10 +207,16 @@ func (m *Manager) DeviceVibrate(ctx context.Context, deviceIndex int, strength f
 	return err
 }
 
-// DeviceStop stops all actions on the given device.
+// DeviceStop stops the given device.
 func (m *Manager) DeviceStop(ctx context.Context, deviceIndex int) error {
 	_, err := m.conn.Send(ctx, &buttplugschema.StopDeviceCmdMessage{
 		DeviceIndex: buttplugschema.DeviceIndex(deviceIndex),
 	})
+	return err
+}
+
+// StopAll stops all devices.
+func (m *Manager) StopAll(ctx context.Context) error {
+	_, err := m.conn.Send(ctx, &buttplugschema.StopAllDevicesMessage{})
 	return err
 }

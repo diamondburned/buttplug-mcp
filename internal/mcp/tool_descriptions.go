@@ -82,5 +82,6 @@ func FormatToolDescriptionsAsYAML(td ToolDescriptions) ([]byte, error) {
 		yaml.Indent(2),
 		yaml.OmitEmpty(),
 		yaml.WithComment(td.comments),
+		yaml.UseLiteralStyleIfMultiline(true),
 	)
 }

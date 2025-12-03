@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"regexp"
-	"strconv"
 	"time"
 
 	"github.com/ConAcademy/buttplug-mcp/internal/bp"
@@ -40,11 +38,12 @@ type Config struct {
 
 // Server is our MCP server.
 type Server struct {
-	mcp    *mcpserver.MCPServer
-	bpm    *bp.Manager
-	logger *slog.Logger
-	config Config
-	td     ToolDescriptions
+	mcp      *mcpserver.MCPServer
+	bpm      *bp.Manager
+	patterns *bp.PatternPlayer
+	logger   *slog.Logger
+	config   Config
+	td       ToolDescriptions
 }
 
 // New creates a new MCP server with the given configuration.
@@ -68,11 +67,12 @@ func New(config Config, bpm *bp.Manager, logger *slog.Logger) (*Server, error) {
 	)
 
 	s := &Server{
-		mcp:    mcp,
-		bpm:    bpm,
-		logger: logger,
-		config: config,
-		td:     td,
+		mcp:      mcp,
+		bpm:      bpm,
+		patterns: bp.NewPatternPlayer(bpm, logger),
+		logger:   logger,
+		config:   config,
+		td:       td,
 	}
 	s.registerTools()
 
@@ -124,23 +124,39 @@ func (s *Server) registerTools() {
 			mcp.Description(s.td.ForToolParameter("device_vibrate", "id")),
 			mcp.Pattern(regexInt),
 		),
-		mcp.WithNumber("strength",
+		mcp.WithArray("pattern",
+			mcp.Description(s.td.ForToolParameter("device_vibrate", "pattern")),
 			mcp.Required(),
-			mcp.Description(s.td.ForToolParameter("device_vibrate", "strength")),
-			mcp.DefaultNumber(1.0),
-			mcp.Min(0.0),
-			mcp.Max(1.0),
+			mcp.Items(map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"strength": convertPropertyOptions(
+						mcp.Description(s.td.ForToolParameter("device_vibrate", "pattern.strength")),
+						mcp.Min(0.0),
+						mcp.Max(1.0),
+					),
+					"duration_sec": convertPropertyOptions(
+						mcp.Description(s.td.ForToolParameter("device_vibrate", "pattern.duration_sec")),
+						mcp.Min(0.1),
+						mcp.Max(3600.0),
+					),
+				},
+				"required": []string{
+					"strength",
+					"duration_sec",
+				},
+			}),
+			mcp.MinItems(1),
 		),
-		mcp.WithNumber("duration_sec",
-			mcp.Required(),
-			mcp.Description(s.td.ForToolParameter("device_vibrate", "duration_sec")),
+		mcp.WithNumber("repeats",
+			mcp.Description(s.td.ForToolParameter("device_vibrate", "repeats")),
+			mcp.DefaultNumber(1),
+			mcp.Min(0),
+		),
+		mcp.WithNumber("return_after_duration_sec",
+			mcp.Description(s.td.ForToolParameter("device_vibrate", "return_after_duration_sec")),
 			mcp.DefaultNumber(0.0),
 			mcp.Min(0.0),
-			mcp.Max(3600.0),
-		),
-		mcp.WithBoolean("stop_after_duration",
-			mcp.Description(s.td.ForToolParameter("device_vibrate", "stop_after_duration")),
-			mcp.DefaultBool(true),
 		),
 	), s.handleDeviceVibrate)
 
@@ -148,69 +164,26 @@ func (s *Server) registerTools() {
 	s.mcp.AddTool(mcp.NewTool("device_stop",
 		mcp.WithTitleAnnotation("Device Stop"),
 		mcp.WithDescription(s.td.ForTool("device_stop")),
-		mcp.WithNumber("id",
-			mcp.Required(),
-			mcp.Description(s.td.ForToolParameter("device_stop", "id")),
-			mcp.Pattern(regexInt),
-		),
 	), s.handleDeviceStop)
 }
 
-func (s *Server) handleDeviceList(_ context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	jbytes, err := s.handleDeviceListRaw()
-	if err != nil {
-		return nil, err
+func convertPropertyOptions(opts ...mcp.PropertyOption) map[string]any {
+	m := make(map[string]any)
+	for _, opt := range opts {
+		opt(m)
 	}
-
-	return []mcp.ResourceContents{
-		&mcp.TextResourceContents{
-			URI:      request.Params.URI,
-			MIMEType: "application/json",
-			Text:     string(jbytes),
-		},
-	}, nil
+	return m
 }
 
 func (s *Server) handleDeviceListTool(_ context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	jbytes, err := s.handleDeviceListRaw()
+	jbytes, err := json.Marshal(map[string]any{
+		"device_ids": s.bpm.DeviceIndexes(),
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	return mcp.NewToolResultText(string(jbytes)), nil
-}
-
-func (s *Server) handleDeviceListRaw() (json.RawMessage, error) {
-	return json.Marshal(map[string]any{
-		"device_ids": s.bpm.DeviceIndexes(),
-	})
-}
-
-var reDeviceID = regexp.MustCompile(`/device/(\d+)`)
-
-func (s *Server) handleDeviceOne(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	deviceIDMatch := reDeviceID.FindStringSubmatch(request.Params.URI)
-	if deviceIDMatch == nil {
-		return nil, fmt.Errorf("invalid device ID in URI")
-	}
-
-	deviceID, err := strconv.Atoi(deviceIDMatch[1])
-	if err != nil {
-		return nil, fmt.Errorf("invalid device ID: %w", err)
-	}
-
-	jbytes, err := s.handleDeviceOneRaw(ctx, deviceID)
-	if err != nil {
-		return nil, err
-	}
-
-	return []mcp.ResourceContents{
-		&mcp.TextResourceContents{
-			URI:      request.Params.URI,
-			MIMEType: "application/json",
-			Text:     string(jbytes),
-		},
-	}, nil
 }
 
 func (s *Server) handleDeviceOneTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -219,7 +192,15 @@ func (s *Server) handleDeviceOneTool(ctx context.Context, request mcp.CallToolRe
 		return nil, fmt.Errorf("id must be set %w", err)
 	}
 
-	jbytes, err := s.handleDeviceOneRaw(ctx, deviceID)
+	device, err := s.bpm.Device(ctx, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query device %d: %w", deviceID, err)
+	}
+
+	jbytes, err := json.Marshal(map[string]any{
+		"device_id": deviceID,
+		"device":    device,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -227,72 +208,40 @@ func (s *Server) handleDeviceOneTool(ctx context.Context, request mcp.CallToolRe
 	return mcp.NewToolResultText(string(jbytes)), nil
 }
 
-func (s *Server) handleDeviceOneRaw(ctx context.Context, deviceID int) (json.RawMessage, error) {
-	device, err := s.bpm.Device(ctx, deviceID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query device %d: %w", deviceID, err)
-	}
-
-	return json.Marshal(map[string]any{
-		"device_id": deviceID,
-		"device":    device,
-	})
-}
-
 func (s *Server) handleDeviceVibrate(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	deviceID, err := request.RequireInt("id")
-	if err != nil {
-		return nil, fmt.Errorf("id must be set %w", err)
+	var args struct {
+		DeviceID               int        `json:"id"`
+		Pattern                bp.Pattern `json:"pattern"`
+		Repeats                int        `json:"repeats"`
+		ReturnAfterDurationSec float64    `json:"return_after_duration_sec"`
 	}
 
-	strength, err := request.RequireFloat("strength")
-	if err != nil {
-		return nil, fmt.Errorf("strength must be set %w", err)
+	if err := request.BindArguments(&args); err != nil {
+		return nil, fmt.Errorf("failed to bind arguments: %w", err)
 	}
 
-	durationSec, err := request.RequireFloat("duration_sec")
-	if err != nil {
-		return nil, fmt.Errorf("duration_sec must be set %w", err)
+	if err := s.patterns.Play(ctx, args.DeviceID, args.Pattern, args.Repeats); err != nil {
+		return nil, fmt.Errorf("failed to play pattern on device %d: %w", args.DeviceID, err)
 	}
 
-	stopAfterDuration, err := request.RequireBool("stop_after_duration")
-	if err != nil {
-		return nil, fmt.Errorf("stop_after_duration must be set %w", err)
-	}
-
-	if err := s.bpm.DeviceVibrate(ctx, deviceID, strength); err != nil {
-		return nil, fmt.Errorf("failed to vibrate device %d: %w", deviceID, err)
-	}
-
-	if durationSec == 0 {
-		return mcp.NewToolResultText(`{ "success": true, "stopped": false }`), nil
+	if args.ReturnAfterDurationSec <= 0 {
+		return mcp.NewToolResultText(`{ "success": true, "waited": false }`), nil
 	}
 
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-time.After(time.Duration(durationSec * float64(time.Second))):
-	}
-
-	if stopAfterDuration {
-		if err := s.bpm.DeviceStop(ctx, deviceID); err != nil {
-			return nil, fmt.Errorf("failed to stop device %d after duration: %w", deviceID, err)
-		}
-
-		return mcp.NewToolResultText(`{ "success": true, "stopped": true }`), nil
-	} else {
-		return mcp.NewToolResultText(`{ "success": true, "stopped": false }`), nil
+	case <-time.After(time.Duration(args.ReturnAfterDurationSec * float64(time.Second))):
+		return mcp.NewToolResultText(`{ "success": true, "waited": true }`), nil
 	}
 }
 
 func (s *Server) handleDeviceStop(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	deviceID, err := request.RequireInt("id")
-	if err != nil {
-		return nil, fmt.Errorf("id must be set %w", err)
-	}
+	// always stop any running pattern
+	s.patterns.StopAll()
 
-	if err := s.bpm.DeviceStop(ctx, deviceID); err != nil {
-		return nil, fmt.Errorf("failed to stop device %d: %w", deviceID, err)
+	if err := s.bpm.StopAll(ctx); err != nil {
+		return nil, fmt.Errorf("failed to stop all devices: %w", err)
 	}
 
 	return mcp.NewToolResultText(`{ "success": true }`), nil

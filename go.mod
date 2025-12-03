@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/goccy/go-yaml v1.19.0
 	github.com/mark3labs/mcp-go v0.31.0
+	github.com/puzpuzpuz/xsync/v4 v4.2.0
 	github.com/spf13/pflag v1.0.6
 	libdb.so/go-buttplug v0.0.8
 )
